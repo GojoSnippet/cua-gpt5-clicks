@@ -1,101 +1,118 @@
 import argparse
+import subprocess
+import sys
 import time
-from openai import OpenAI
+import os
 
-from config import MODEL, MAX_TURNS, VNC_PORT, CONTAINER_NAME
-from docker_helpers import (
-    start_container,
-    stop_container,
-    capture_screenshot,
-    handle_actions,
-    SCREENSHOT_DIR,
-)
-
-client = OpenAI()
+from config import CONTAINER_NAME, VNC_PORT
 
 
-def run_agent(message: str):
-    """The core agent loop: task -> actions -> screenshot -> repeat."""
+def run_local(message: str, no_stop: bool):
+    """Local Docker mode — agent runs on your laptop."""
+    from docker_runtime import DockerRuntime
+    from agent import run_agent
 
-    print(f"\n{'='*60}")
-    print(f"  Computer-Use Agent")
-    print(f"  Model: {MODEL} | Container: {CONTAINER_NAME} | VNC: localhost:{VNC_PORT}")
-    print(f"{'='*60}")
+    runtime = DockerRuntime()
+    runtime.start()
+    try:
+        run_agent(runtime, message)
+    finally:
+        if not no_stop:
+            runtime.stop()
 
-    print(f'\n[task] "{message}"')
-    print(f"[agent] Sending task to GPT-5.4 ...\n")
 
-    response = client.responses.create(
-        model=MODEL,
-        tools=[{"type": "computer"}],
-        input=message,
-        truncation="auto",
+def run_kube(message: str):
+    """Kubernetes mode — agent runs inside the pod."""
+
+    # 0. Create namespace
+    subprocess.run(["kubectl", "apply", "-f", "k8s/namespace.yaml"], check=True)
+    print("[kube] Namespace 'cua' ready.")
+
+    # 1. Create secret if it doesn't exist
+    from dotenv import load_dotenv
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("[error] OPENAI_API_KEY not found in .env", file=sys.stderr)
+        sys.exit(1)
+
+    subprocess.run(
+        ["kubectl", "delete", "secret", "openai-api-key", "-n", "cua", "--ignore-not-found"],
+        capture_output=True,
     )
+    subprocess.run(
+        ["kubectl", "create", "secret", "generic", "openai-api-key",
+         f"--from-literal=OPENAI_API_KEY={api_key}", "-n", "cua"],
+        capture_output=True, check=True,
+    )
+    print("[kube] Secret created.")
 
-    turn = 0
-    while turn < MAX_TURNS:
-        turn += 1
-        print(f"\n── Turn {turn}/{MAX_TURNS} {'─'*44}")
+    # 2. Apply service
+    subprocess.run(["kubectl", "apply", "-f", "k8s/service.yaml"], check=True)
+    print(f"[kube] VNC -> localhost:30501")
 
-        # Find computer_call and messages in response
-        computer_call = None
-        for item in response.output:
-            if item.type == "computer_call":
-                computer_call = item
-            elif item.type == "message":
-                for part in item.content:
-                    if hasattr(part, "text"):
-                        print(f'\n  [gpt] "{part.text}"')
+    # 3. Apply job with task message injected
+    subprocess.run(
+        ["kubectl", "delete", "job", "cua-agent", "-n", "cua", "--ignore-not-found"],
+        capture_output=True,
+    )
+    time.sleep(2)
 
-        # No computer_call means GPT is done
-        if computer_call is None:
-            print(f"\n  [done] Task complete — no more actions.")
-            break
+    # Read job yaml and inject task message
+    with open("k8s/job.yaml", "r") as f:
+        job_yaml = f.read()
+    job_yaml = job_yaml.replace("__TASK_MESSAGE__", message.replace('"', '\\"'))
 
-        # Execute actions (prints its own formatted log)
-        handle_actions(computer_call.actions)
+    subprocess.run(
+        ["kubectl", "apply", "-f", "-"],
+        input=job_yaml.encode(),
+        check=True,
+    )
+    print("[kube] Job created.")
 
-        # Brief pause for screen to update
-        time.sleep(0.5)
-
-        # Take screenshot
-        screenshot_b64 = capture_screenshot(step=turn)
-
-        if not screenshot_b64:
-            print("  [agent] Empty screenshot — retrying in 2s ...")
-            time.sleep(2)
-            screenshot_b64 = capture_screenshot(step=turn)
-
-        if not screenshot_b64:
-            print("  [agent] Still empty — skipping this turn.")
-            continue
-
-        # Send screenshot to GPT
-        print("  [agent] Sending screenshot to GPT ...")
-        response = client.responses.create(
-            model=MODEL,
-            tools=[{"type": "computer"}],
-            previous_response_id=response.id,
-            input=[{
-                "type": "computer_call_output",
-                "call_id": computer_call.call_id,
-                "output": {
-                    "type": "computer_screenshot",
-                    "image_url": f"data:image/png;base64,{screenshot_b64}",
-                },
-            }],
-            truncation="auto",
+    # 4. Wait for pod to start
+    print("[kube] Waiting for pod ...")
+    pod_name = None
+    for _ in range(60):
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-n", "cua", "-l", "job-name=cua-agent",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True, text=True,
         )
+        if result.returncode == 0 and result.stdout.strip():
+            pod_name = result.stdout.strip()
+            # Check if running
+            phase = subprocess.run(
+                ["kubectl", "get", "pod", pod_name, "-n", "cua", "-o", "jsonpath={.status.phase}"],
+                capture_output=True, text=True,
+            )
+            if phase.stdout.strip() in ("Running", "Succeeded"):
+                break
+        time.sleep(2)
+    else:
+        print("[kube] Warning: pod may not be ready.", file=sys.stderr)
 
-    if turn >= MAX_TURNS:
-        print(f"\n  [agent] Hit max turns limit ({MAX_TURNS}) — stopping.")
+    if not pod_name:
+        print("[error] Could not find pod.", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"\n{'='*60}")
-    print(f"  DONE — completed in {turn} turns")
-    print(f"  Screenshots saved to: {SCREENSHOT_DIR}/")
-    container_status = "running"
-    print(f"  Container: {container_status} (VNC -> localhost:{VNC_PORT})")
-    print(f"{'='*60}\n")
+    print(f"[kube] Pod: {pod_name}")
+    print(f"[kube] Streaming logs ...\n")
+
+    # 5. Stream logs until job completes
+    try:
+        subprocess.run(
+            ["kubectl", "logs", "-f", pod_name, "-n", "cua"],
+        )
+    except KeyboardInterrupt:
+        print("\n[kube] Interrupted.")
+
+    # 6. Cleanup
+    print("\n[kube] Cleaning up ...")
+    subprocess.run(["kubectl", "delete", "-f", "k8s/job.yaml", "--ignore-not-found"], capture_output=True)
+    subprocess.run(["kubectl", "delete", "-f", "k8s/service.yaml", "--ignore-not-found"], capture_output=True)
+    subprocess.run(["kubectl", "delete", "secret", "openai-api-key", "-n", "cua", "--ignore-not-found"], capture_output=True)
+    print("[kube] Done.")
 
 
 def main():
@@ -105,21 +122,24 @@ def main():
     parser.add_argument(
         "--message", "-m",
         required=True,
-        help='The task for the agent (e.g. "open Firefox and search weather in SF")',
+        help='The task for the agent',
     )
     parser.add_argument(
         "--no-stop",
         action="store_true",
-        help="Keep the container running after the agent finishes",
+        help="Keep the container running after the agent finishes (local mode only)",
+    )
+    parser.add_argument(
+        "--kube",
+        action="store_true",
+        help="Run on Kubernetes instead of local Docker",
     )
     args = parser.parse_args()
 
-    start_container()
-    try:
-        run_agent(args.message)
-    finally:
-        if not args.no_stop:
-            stop_container()
+    if args.kube:
+        run_kube(args.message)
+    else:
+        run_local(args.message, args.no_stop)
 
 
 if __name__ == "__main__":

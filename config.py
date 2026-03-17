@@ -1,7 +1,10 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # running inside k8s, env vars set by secret
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

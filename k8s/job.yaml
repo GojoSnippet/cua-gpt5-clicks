@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cua-agent
+  namespace: cua
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: cua-agent
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: cua-agent-k8s
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5901
+          env:
+            - name: TASK_MESSAGE
+              value: "__TASK_MESSAGE__"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-api-key
+                  key: OPENAI_API_KEY
+          resources:
+            limits:
+              memory: "2Gi"
+              cpu: "2"
